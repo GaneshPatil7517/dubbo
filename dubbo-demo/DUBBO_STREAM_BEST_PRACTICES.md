@@ -422,7 +422,7 @@ public class ResilientDataService {
                     }
                     
                     // Use fallback service
-                    primaryStub.streamData(request, this);
+                    fallbackStub.streamData(request, this);
                 }
                 
                 @Override
@@ -463,6 +463,18 @@ public class HeartbeatStreamService {
         return new StreamObserver<StreamMessage>() {
             private volatile long lastActivityTime = 
                 System.currentTimeMillis();
+            private final long heartbeatInterval = 30000; // 30 seconds
+            
+            {
+                // Schedule periodic heartbeat check
+                executor.scheduleAtFixedRate(() -> {
+                    long now = System.currentTimeMillis();
+                    if (now - lastActivityTime > heartbeatInterval * 2) {
+                        logger.warn("No activity detected, closing stream");
+                        responseObserver.onCompleted();
+                    }
+                }, heartbeatInterval, heartbeatInterval, TimeUnit.MILLISECONDS);
+            }
             
             @Override
             public void onNext(StreamMessage message) {
@@ -515,14 +527,18 @@ public class OrderedStreamProcessor {
         if (currentSequence == expectedSequence) {
             // Process message
             processMessage(message);
-            lastProcessedSequence.set(currentSequence);
             
-            // Send acknowledgment
-            StreamMessage ack = StreamMessage.newBuilder()
-                .setSequence(currentSequence)
-                .setType("ACK")
-                .build();
-            responseObserver.onNext(ack);
+            // Atomically advance the sequence to ensure ordered processing
+            if (lastProcessedSequence.compareAndSet(
+                expectedSequence - 1, currentSequence)) {
+                
+                // Send acknowledgment
+                StreamMessage ack = StreamMessage.newBuilder()
+                    .setSequence(currentSequence)
+                    .setType("ACK")
+                    .build();
+                responseObserver.onNext(ack);
+            }
             
         } else if (currentSequence > expectedSequence) {
             // Out of order - request retransmission
@@ -633,8 +649,16 @@ Use message IDs to detect and handle duplicates:
 ```java
 public class IdempotentStreamProcessor {
     
-    private final Set<String> processedMessageIds = 
-        Collections.synchronizedSet(new HashSet<>());
+    // Use bounded cache with eviction policy (e.g., Caffeine cache)
+    private final Map<String, Response> processedMessageIds = 
+        new ConcurrentHashMap<>(1000);  // Maximum 1000 entries
+    
+    // Alternatively, use Caffeine for automatic eviction:
+    // private final Cache<String, Response> processedMessageIds =
+    //     Caffeine.newBuilder()
+    //         .maximumSize(10000)
+    //         .expireAfterWrite(1, TimeUnit.HOURS)
+    //         .build();
     
     @Override
     public StreamObserver<Message> idempotentStream(
@@ -646,9 +670,9 @@ public class IdempotentStreamProcessor {
             public void onNext(Message message) {
                 String messageId = message.getId();
                 
-                if (processedMessageIds.contains(messageId)) {
+                if (processedMessageIds.containsKey(messageId)) {
                     // Duplicate - send previous response
-                    Response response = getCachedResponse(messageId);
+                    Response response = processedMessageIds.get(messageId);
                     responseObserver.onNext(response);
                     return;
                 }
@@ -656,7 +680,7 @@ public class IdempotentStreamProcessor {
                 // Process message
                 try {
                     Response response = processAndCacheResult(message);
-                    processedMessageIds.add(messageId);
+                    processedMessageIds.put(messageId, response);
                     responseObserver.onNext(response);
                 } catch (Exception e) {
                     responseObserver.onError(e);
@@ -1140,15 +1164,21 @@ public class MonitoringConfig {
         PrometheusMeterRegistry registry = 
             new PrometheusMeterRegistry(PrometheusConfig.DEFAULT);
         
-        // Stream-specific meters
-        registry.counter("stream.messages.sent", "service");
-        registry.counter("stream.messages.received", "service");
-        registry.counter("stream.errors", "service", "type");
-        registry.timer("stream.processing.duration", "service");
-        registry.gauge("stream.active.connections", "service");
+        // Store metric instances for reuse when recording metrics
+        sentCounter = registry.counter("stream.messages.sent", "service");
+        receivedCounter = registry.counter("stream.messages.received", "service");
+        errorCounter = registry.counter("stream.errors", "service", "type");
+        processingTimer = registry.timer("stream.processing.duration", "service");
+        activeConnectionsGauge = registry.gauge("stream.active.connections", "service");
         
         return registry;
     }
+    
+    private Counter sentCounter;
+    private Counter receivedCounter;
+    private Counter errorCounter;
+    private Timer processingTimer;
+    private AtomicDouble activeConnectionsGauge;
     
     @Bean
     public TracingConfig tracingConfig() {
